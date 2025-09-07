@@ -6,6 +6,8 @@ using System.Reflection;
 using System.CodeDom.Compiler;
 using Microsoft.CSharp;
 using System.Windows.Forms;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace SelfExtractGenerator
 {
@@ -15,26 +17,9 @@ namespace SelfExtractGenerator
         static void Main(string[] args)
         {
             Console.Title = "Self-Extract Generator";
-            if (!IsRunAsAdmin())
-            {
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine("检测到非管理员权限。尝试提升权限...");
-                Console.ResetColor();
-                if (!ElevatePrivileges())
-                {
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine("权限提升失败。请以管理员身份手动运行此程序。");
-                    Console.ResetColor();
-                    Console.WriteLine("按任意键退出...");
-                    Console.ReadKey();
-                    return;
-                }
-                return; // 如果提升成功，进程会退出，原进程被新进程替换
-            }
 
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine("=== 自解压文件生成器 v1.0 ===");
-            Console.WriteLine("运行于管理员权限。");
             Console.ResetColor();
 
             try
@@ -154,32 +139,6 @@ namespace SelfExtractGenerator
             }
         }
 
-        static bool IsRunAsAdmin()
-        {
-            WindowsIdentity identity = WindowsIdentity.GetCurrent();
-            WindowsPrincipal principal = new WindowsPrincipal(identity);
-            return principal.IsInRole(WindowsBuiltInRole.Administrator);
-        }
-
-        static bool ElevatePrivileges()
-        {
-            try
-            {
-                ProcessStartInfo startInfo = new ProcessStartInfo
-                {
-                    FileName = Assembly.GetExecutingAssembly().Location,
-                    Verb = "runas",
-                    UseShellExecute = true
-                };
-                Process.Start(startInfo);
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
         static long GetMaxFileSizeBasedOnMemory()
         {
             try
@@ -197,12 +156,70 @@ namespace SelfExtractGenerator
             }
         }
 
+        // AES对称加密
+        static byte[] EncryptData(byte[] data, byte[] key, byte[] iv)
+        {
+            using (Aes aes = Aes.Create())
+            {
+                aes.Key = key;
+                aes.IV = iv;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+
+                using (MemoryStream ms = new MemoryStream())
+                {
+                    using (CryptoStream cs = new CryptoStream(ms, aes.CreateEncryptor(), CryptoStreamMode.Write))
+                    {
+                        cs.Write(data, 0, data.Length);
+                    }
+                    return ms.ToArray();
+                }
+            }
+        }
+
+        // 生成复杂的加密密钥和IV
+        static void GenerateKeyAndIV(string fileName, int fileSize, out byte[] key, out byte[] iv)
+        {
+            // 使用固定的时间戳以确保加密解密一致性
+            long fixedTimestamp = 638672000000000000L; // 固定时间戳
+            
+            // 使用复杂的基础字符串生成密钥
+            string complexToken = "SelfExtractor2024_Advanced_Encryption_Token_" + 
+                                 "9A7B3F2E8D6C5A4B1E9F7D3C8A6B4E2F5A9D7C3B6E8F1A4C7B9E2D5F8A3C6B9E" +
+                                 "_ComplexSalt_" + fileName + "_Size_" + fileSize.ToString() + 
+                                 "_Timestamp_" + fixedTimestamp.ToString() +
+                                 "_RandomSeed_7F3E9A2D5C8B1F4A6E9D3B7C2A5E8F1B4D7A3C6E9F2B5A8D1C4F7B3E6A9D2C5F8";
+
+            // 使用SHA256生成密钥
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                byte[] hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(complexToken));
+                key = hashBytes; // SHA256 produces 32 bytes, perfect for AES-256
+            }
+
+            // 为IV生成不同的哈希
+            string ivSource = complexToken + "_IV_Salt_" + "F3A7B2E9D5C1A8F4B6E2D9C3A7F1B5E8D2C6A9F3B7E1C4A8D5F2B9E6C3A7F1B4";
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                byte[] ivHashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(ivSource));
+                iv = new byte[16]; // AES IV is 16 bytes
+                Array.Copy(ivHashBytes, 0, iv, 0, 16);
+            }
+        }
+
         static void GenerateSelfExtractor(string exePath, byte[] fileBytes, string fileName)
         {
-            // 创建临时资源文件来存储二进制数据
+            // 生成加密密钥和IV
+            byte[] key, iv;
+            GenerateKeyAndIV(fileName, fileBytes.Length, out key, out iv);
+            
+            // 加密文件数据
+            byte[] encryptedBytes = EncryptData(fileBytes, key, iv);
+            
+            // 创建临时资源文件来存储加密的二进制数据
             string tempDir = Path.GetTempPath();
             string resourceFile = Path.Combine(tempDir, "embedded_file.dat");
-            File.WriteAllBytes(resourceFile, fileBytes);
+            File.WriteAllBytes(resourceFile, encryptedBytes);
 
             try
             {
@@ -210,54 +227,40 @@ namespace SelfExtractGenerator
                 string sourceCode = @"
 using System;
 using System.IO;
-using System.Security.Principal;
 using System.Reflection;
-using System.Diagnostics;
 using System.Windows.Forms;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace SelfExtractor
 {
     class Program
     {
+        const string fileName = """ + fileName + @""";
         [STAThread]
         static void Main(string[] args)
         {
             try
             {
-                // 初始化 Windows Forms 应用程序
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                
                 Console.Title = ""Self-Extractor"";
-                
-                // 写入调试日志
-                WriteDebugLog(""程序启动"");
-                
-                if (!IsRunAsAdmin())
-                {
-                    Console.ForegroundColor = ConsoleColor.Yellow;
-                    Console.WriteLine(""建议以管理员身份运行以避免权限问题。"");
-                    Console.ResetColor();
-                }
             }
             catch (Exception ex)
             {
-                WriteDebugLog(""初始化错误: "" + ex.Message);
                 MessageBox.Show(""初始化错误: "" + ex.Message, ""错误"", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
 
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine(""=== 自解压工具 ==="");
-            Console.WriteLine(""将释放文件: " + fileName + @""");
+            Console.WriteLine(""将释放文件: "" + fileName);
             Console.ResetColor();
 
             try
             {
-                WriteDebugLog(""开始选择释放路径"");
                 Console.WriteLine(""\n选择释放路径..."");
                 string targetDir = SelectOutputFolder();
-                WriteDebugLog(""选择的路径: "" + (targetDir ?? ""null""));
                 
                 if (string.IsNullOrEmpty(targetDir))
                 {
@@ -276,10 +279,8 @@ namespace SelfExtractor
                     Console.ResetColor();
                 }
 
-                WriteDebugLog(""开始提取文件数据"");
-                string targetFile = Path.Combine(targetDir, """ + fileName + @""");
+                string targetFile = Path.Combine(targetDir, fileName);
                 byte[] fileData = GetEmbeddedFileData();
-                WriteDebugLog(""文件数据大小: "" + fileData.Length + "" bytes"");
                 
                 File.WriteAllBytes(targetFile, fileData);
 
@@ -293,7 +294,6 @@ namespace SelfExtractor
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine(errorMsg);
                 Console.ResetColor();
-                WriteDebugLog(errorMsg);
                 MessageBox.Show(errorMsg, ""错误"", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
 
@@ -305,44 +305,78 @@ namespace SelfExtractor
         {
             try
             {
-                WriteDebugLog(""进入文件夹选择对话框"");
                 FolderBrowserDialog folderBrowserDialog = new FolderBrowserDialog
                 {
                     Description = ""选择文件释放位置"",
                     ShowNewFolderButton = true
                 };
 
-                // 设置初始路径为桌面
                 folderBrowserDialog.SelectedPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
                 
-                WriteDebugLog(""显示文件夹选择对话框"");
                 DialogResult result = folderBrowserDialog.ShowDialog();
-                WriteDebugLog(""对话框结果: "" + result.ToString());
                 
                 if (result == DialogResult.OK && !string.IsNullOrWhiteSpace(folderBrowserDialog.SelectedPath))
                 {
-                    WriteDebugLog(""选择的路径: "" + folderBrowserDialog.SelectedPath);
                     return folderBrowserDialog.SelectedPath;
                 }
                 
-                WriteDebugLog(""未选择路径或取消"");
                 return null;
             }
             catch (Exception ex)
             {
                 string errorMsg = ""文件夹选择错误: "" + ex.Message;
-                WriteDebugLog(errorMsg);
                 Console.WriteLine(errorMsg);
                 MessageBox.Show(errorMsg, ""错误"", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return null;
             }
         }
 
-        static bool IsRunAsAdmin()
+        static byte[] DecryptData(byte[] encryptedData, byte[] key, byte[] iv)
         {
-            WindowsIdentity identity = WindowsIdentity.GetCurrent();
-            WindowsPrincipal principal = new WindowsPrincipal(identity);
-            return principal.IsInRole(WindowsBuiltInRole.Administrator);
+            using (Aes aes = Aes.Create())
+            {
+                aes.Key = key;
+                aes.IV = iv;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+
+                using (MemoryStream ms = new MemoryStream(encryptedData))
+                {
+                    using (CryptoStream cs = new CryptoStream(ms, aes.CreateDecryptor(), CryptoStreamMode.Read))
+                    {
+                        using (MemoryStream result = new MemoryStream())
+                        {
+                            cs.CopyTo(result);
+                            return result.ToArray();
+                        }
+                    }
+                }
+            }
+        }
+
+        static void GenerateKeyAndIV(string fileName, int originalFileSize, out byte[] key, out byte[] iv)
+        {
+            long fixedTimestamp = 638672000000000000L;
+            
+            string complexToken = ""SelfExtractor2024_Advanced_Encryption_Token_"" + 
+                                 ""9A7B3F2E8D6C5A4B1E9F7D3C8A6B4E2F5A9D7C3B6E8F1A4C7B9E2D5F8A3C6B9E"" +
+                                 ""_ComplexSalt_"" + fileName + ""_Size_"" + originalFileSize.ToString() + 
+                                 ""_Timestamp_"" + fixedTimestamp.ToString() +
+                                 ""_RandomSeed_7F3E9A2D5C8B1F4A6E9D3B7C2A5E8F1B4D7A3C6E9F2B5A8D1C4F7B3E6A9D2C5F8"";
+
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                byte[] hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(complexToken));
+                key = hashBytes;
+            }
+
+            string ivSource = complexToken + ""_IV_Salt_"" + ""F3A7B2E9D5C1A8F4B6E2D9C3A7F1B5E8D2C6A9F3B7E1C4A8D5F2B9E6C3A7F1B4"";
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                byte[] ivHashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(ivSource));
+                iv = new byte[16];
+                Array.Copy(ivHashBytes, 0, iv, 0, 16);
+            }
         }
 
         static byte[] GetEmbeddedFileData()
@@ -350,7 +384,6 @@ namespace SelfExtractor
             Assembly assembly = Assembly.GetExecutingAssembly();
             string[] resourceNames = assembly.GetManifestResourceNames();
             
-            // 查找第一个.dat资源文件
             string resourceName = null;
             foreach (string name in resourceNames)
             {
@@ -362,37 +395,26 @@ namespace SelfExtractor
             }
             
             if (resourceName == null)
-                throw new InvalidOperationException(""无法找到嵌入的文件资源。可用资源: "" + string.Join("", "", resourceNames));
+                throw new InvalidOperationException(""无法找到嵌入的文件资源。"");
             
-            WriteDebugLog(""找到资源: "" + resourceName);
             using (Stream stream = assembly.GetManifestResourceStream(resourceName))
             {
                 if (stream == null)
                     throw new InvalidOperationException(""无法读取嵌入的文件资源: "" + resourceName);
                 
-                byte[] buffer = new byte[stream.Length];
-                stream.Read(buffer, 0, buffer.Length);
-                WriteDebugLog(""成功读取 "" + buffer.Length + "" bytes 数据"");
-                return buffer;
-            }
-        }
-        
-        static void WriteDebugLog(string message)
-        {
-            try
-            {
-                string logFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), ""SelfExtractor_Debug.log"");
-                string logEntry = DateTime.Now.ToString(""yyyy-MM-dd HH:mm:ss"") + "" - "" + message + Environment.NewLine;
-                File.AppendAllText(logFile, logEntry);
-            }
-            catch
-            {
-                // 忽略日志写入错误
+                byte[] encryptedBuffer = new byte[stream.Length];
+                stream.Read(encryptedBuffer, 0, encryptedBuffer.Length);
+                
+                int originalFileSize = " + fileBytes.Length + @";
+                byte[] key, iv;
+                GenerateKeyAndIV(fileName, originalFileSize, out key, out iv);
+                byte[] decryptedData = DecryptData(encryptedBuffer, key, iv);
+                
+                return decryptedData;
             }
         }
     }
 }";
-
                 // 使用 CodeDom 编译源代码成 EXE
                 CSharpCodeProvider provider = new CSharpCodeProvider();
                 CompilerParameters parameters = new CompilerParameters
@@ -405,7 +427,7 @@ namespace SelfExtractor
                 parameters.ReferencedAssemblies.Add("System.Core.dll");
                 parameters.ReferencedAssemblies.Add("System.Windows.Forms.dll");
                 
-                // 将资源文件作为嵌入资源添加
+                // 将加密的资源文件作为嵌入资源添加
                 parameters.EmbeddedResources.Add(resourceFile);
 
                 CompilerResults results = provider.CompileAssemblyFromSource(parameters, sourceCode);
