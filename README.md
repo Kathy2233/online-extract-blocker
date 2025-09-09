@@ -18,6 +18,7 @@ By doing so, it prevents the platform from blocking your shared link through **h
 
 ---
 ## 注意事项 | Notes
+#由于我没签名，没钱，所以创建携带密码的exe时可能被WD报毒拦截！！！
 由于是自解压 `.exe`，网盘无法执行以查看其中的文件。  
 但需要注意的是，该文件只能在 **Windows 10/11 或其他支持 .NET Framework 4.0 的设备** 上打开查看。  
 
