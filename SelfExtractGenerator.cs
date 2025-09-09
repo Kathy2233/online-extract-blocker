@@ -8,6 +8,7 @@ using Microsoft.CSharp;
 using System.Windows.Forms;
 using System.Security.Cryptography;
 using System.Text;
+using System.IO.Compression;
 
 namespace SelfExtractGenerator
 {
@@ -19,7 +20,7 @@ namespace SelfExtractGenerator
             Console.Title = "Self-Extract Generator";
 
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine("=== 自解压文件生成器 v1.0 ===");
+            Console.WriteLine("=== 自解压文件生成器 ===");
             Console.ResetColor();
 
             try
@@ -27,29 +28,31 @@ namespace SelfExtractGenerator
                 // 计算最大文件大小基于可用内存
                 long maxFileSize = GetMaxFileSizeBasedOnMemory();
                 Console.WriteLine("\n系统可用内存约: " + (maxFileSize / (1024 * 1024)) + " MB");
-                Console.WriteLine("最大支持文件大小: " + (maxFileSize / (1024 * 1024)) + " MB (基于80%可用内存)");
+                Console.WriteLine("最大支持文件大小: " + (maxFileSize / (1024 * 1024)) + " MB ");
                 Console.ResetColor();
 
-                // 步骤1: 选择源文件
-                Console.WriteLine("\n步骤1: 选择源文件");
-                string sourceFile = SelectSourceFile();
-                if (string.IsNullOrEmpty(sourceFile))
+                // 步骤1: 选择文件/文件夹（可多选）
+                Console.WriteLine("\n步骤1: 选择文件/文件夹（可多选）");
+                var selections = CollectSelections();
+                if (selections == null || selections.Count == 0)
                 {
-                    Console.WriteLine("未选择源文件，程序退出。");
+                    Console.WriteLine("未选择任何内容，程序退出。");
                     Console.WriteLine("\n按任意键退出...");
                     Console.ReadKey();
                     return;
                 }
-                FileInfo fileInfo = new FileInfo(sourceFile);
-                if (fileInfo.Length > maxFileSize)
+
+                long totalSize = ComputeTotalSize(selections);
+                if (totalSize > maxFileSize)
                 {
-                    throw new InvalidOperationException("源文件过大（" + (fileInfo.Length / (1024 * 1024)) + " MB），超过系统可用内存限制 (" + (maxFileSize / (1024 * 1024)) + " MB)。请选择较小文件。");
+                    throw new InvalidOperationException("选择内容过大（" + (totalSize / (1024 * 1024)) + " MB），超过系统可用内存限制 (" + (maxFileSize / (1024 * 1024)) + " MB)。请减少文件或分批处理。");
                 }
 
-                byte[] fileBytes = File.ReadAllBytes(sourceFile);
-                string fileName = Path.GetFileName(sourceFile);
+                // 打包为 ZIP（统一打包，便于解压端展开）
+                byte[] fileBytes = BuildZip(selections);
+                string fileName = "Package_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".zip";
                 Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine("源文件加载成功: " + fileName + " (" + fileBytes.Length + " 字节)");
+                Console.WriteLine("内容打包完成: " + fileName + " (" + fileBytes.Length + " 字节)");
                 Console.ResetColor();
 
                 // 步骤2: 指定输出文件夹
@@ -70,14 +73,18 @@ namespace SelfExtractGenerator
                     Console.ResetColor();
                 }
 
+                // 可选：用户自定义 key 与时间戳
+                string userToken = PromptUserToken();
+                long timestampTicks = DateTime.UtcNow.Ticks;
+
                 // 步骤3: 生成自解压 EXE
                 string exeName = "SelfExtractor_" + Path.GetFileNameWithoutExtension(fileName) + ".exe";
                 string exePath = Path.Combine(outputDir, exeName);
-                GenerateSelfExtractor(exePath, fileBytes, fileName);
+                GenerateSelfExtractor(exePath, fileBytes, fileName, userToken, timestampTicks);
 
                 Console.ForegroundColor = ConsoleColor.Green;
                 Console.WriteLine("\n自解压 EXE 生成成功: " + exePath);
-                Console.WriteLine("运行该 EXE 时，它会提示指定释放路径，然后提取原文件。");
+                Console.WriteLine("运行该 EXE 时，它会提示指定释放路径，然后解密并解压ZIP内容。");
                 Console.ResetColor();
             }
             catch (Exception ex)
@@ -147,7 +154,7 @@ namespace SelfExtractGenerator
                 availableMemoryCounter.NextValue(); // 首次调用可能返回0
                 float availableMB = availableMemoryCounter.NextValue();
                 availableMemoryCounter.Dispose();
-                return (long)(availableMB * 1024 * 1024 * 0.8); // 80% of available memory
+                return (long)(availableMB * 1024 * 1024 * 0.8); 
             }
             catch
             {
@@ -156,74 +163,216 @@ namespace SelfExtractGenerator
             }
         }
 
+        // 修改：可选输入 Key，取消长度限制
+        static string PromptUserToken()
+        {
+            Console.Write("\n是否输入自定义 Key? (Y/n): ");
+            string choice = Console.ReadLine();
+            bool useKey = string.IsNullOrWhiteSpace(choice) || choice.Trim().Equals("y", StringComparison.OrdinalIgnoreCase);
+            if (!useKey)
+            {
+                Console.WriteLine("将使用默认派生（不包含用户 Key）。");
+                return string.Empty;
+            }
+
+            Console.Write("请输入 Key（可留空，直接回车使用默认）：");
+            string key = Console.ReadLine();
+            return key ?? string.Empty;
+        }
+
         // AES对称加密
-        static byte[] EncryptData(byte[] data, byte[] key, byte[] iv)
+        // 替换：AES加密，随机IV，返回 IV||Ciphertext
+        static byte[] EncryptData(byte[] data, byte[] key)
         {
             using (Aes aes = Aes.Create())
             {
                 aes.Key = key;
-                aes.IV = iv;
                 aes.Mode = CipherMode.CBC;
                 aes.Padding = PaddingMode.PKCS7;
+                aes.GenerateIV();
 
-                using (MemoryStream ms = new MemoryStream())
+                using (var ms = new MemoryStream())
                 {
-                    using (CryptoStream cs = new CryptoStream(ms, aes.CreateEncryptor(), CryptoStreamMode.Write))
+                    // 前16字节写入IV
+                    ms.Write(aes.IV, 0, aes.IV.Length);
+                    using (var cs = new CryptoStream(ms, aes.CreateEncryptor(), CryptoStreamMode.Write))
                     {
                         cs.Write(data, 0, data.Length);
                     }
-                    return ms.ToArray();
+                    return ms.ToArray(); // IV + CIPHERTEXT
                 }
             }
         }
 
-        // 生成复杂的加密密钥和IV
-        static void GenerateKeyAndIV(string fileName, int fileSize, out byte[] key, out byte[] iv)
+        // 修改：派生AES-256密钥（兼容空Key）
+        static byte[] DeriveKey(string userToken, string fileName, int fileSize, long timestampTicks)
         {
-            // 使用固定的时间戳以确保加密解密一致性
-            long fixedTimestamp = 638672000000000000L; // 固定时间戳
-            
-            // 使用复杂的基础字符串生成密钥
-            string complexToken = "SelfExtractor2024_Advanced_Encryption_Token_" + 
-                                 "9A7B3F2E8D6C5A4B1E9F7D3C8A6B4E2F5A9D7C3B6E8F1A4C7B9E2D5F8A3C6B9E" +
-                                 "_ComplexSalt_" + fileName + "_Size_" + fileSize.ToString() + 
-                                 "_Timestamp_" + fixedTimestamp.ToString() +
-                                 "_RandomSeed_7F3E9A2D5C8B1F4A6E9D3B7C2A5E8F1B4D7A3C6E9F2B5A8D1C4F7B3E6A9D2C5F8";
-
-            // 使用SHA256生成密钥
+            string safeToken = userToken ?? string.Empty;
+            string material = safeToken + "|" + fileName + "|" + fileSize.ToString() + "|" + timestampTicks.ToString() + "|SelfExtractor2024";
             using (SHA256 sha256 = SHA256.Create())
             {
-                byte[] hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(complexToken));
-                key = hashBytes; // SHA256 produces 32 bytes, perfect for AES-256
-            }
-
-            // 为IV生成不同的哈希
-            string ivSource = complexToken + "_IV_Salt_" + "F3A7B2E9D5C1A8F4B6E2D9C3A7F1B5E8D2C6A9F3B7E1C4A8D5F2B9E6C3A7F1B4";
-            using (SHA256 sha256 = SHA256.Create())
-            {
-                byte[] ivHashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(ivSource));
-                iv = new byte[16]; // AES IV is 16 bytes
-                Array.Copy(ivHashBytes, 0, iv, 0, 16);
+                return sha256.ComputeHash(Encoding.UTF8.GetBytes(material)); // 32字节
             }
         }
 
-        static void GenerateSelfExtractor(string exePath, byte[] fileBytes, string fileName)
+        // 交互式收集多选路径（文件可多选，文件夹可多次添加）
+        static System.Collections.Generic.List<string> CollectSelections()
         {
-            // 生成加密密钥和IV
-            byte[] key, iv;
-            GenerateKeyAndIV(fileName, fileBytes.Length, out key, out iv);
-            
-            // 加密文件数据
-            byte[] encryptedBytes = EncryptData(fileBytes, key, iv);
-            
-            // 创建临时资源文件来存储加密的二进制数据
+            var list = new System.Collections.Generic.List<string>();
+            while (true)
+            {
+                Console.Write("添加 文件(F)/文件夹(D)，完成(Enter)，取消(C): ");
+                string input = Console.ReadLine();
+                if (string.IsNullOrWhiteSpace(input)) break;
+                input = input.Trim().ToLowerInvariant();
+                if (input == "c") { list.Clear(); break; }
+                if (input == "f")
+                {
+                    try
+                    {
+                        OpenFileDialog ofd = new OpenFileDialog
+                        {
+                            Title = "选择文件（可多选）",
+                            Filter = "所有文件 (*.*)|*.*",
+                            Multiselect = true,
+                            RestoreDirectory = true
+                        };
+                        if (ofd.ShowDialog() == DialogResult.OK && ofd.FileNames?.Length > 0)
+                        {
+                            list.AddRange(ofd.FileNames);
+                            Console.WriteLine("已添加文件: " + ofd.FileNames.Length);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("添加文件出错: " + ex.Message);
+                    }
+                }
+                else if (input == "d")
+                {
+                    try
+                    {
+                        FolderBrowserDialog fbd = new FolderBrowserDialog
+                        {
+                            Description = "选择文件夹",
+                            ShowNewFolderButton = true
+                        };
+                        if (fbd.ShowDialog() == DialogResult.OK && !string.IsNullOrWhiteSpace(fbd.SelectedPath))
+                        {
+                            list.Add(fbd.SelectedPath);
+                            Console.WriteLine("已添加文件夹: " + fbd.SelectedPath);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("添加文件夹出错: " + ex.Message);
+                    }
+                }
+            }
+            return list;
+        }
+
+        // 计算所选内容总大小（文件夹递归）
+        static long ComputeTotalSize(System.Collections.Generic.List<string> selections)
+        {
+            long total = 0;
+            foreach (var p in selections)
+            {
+                if (File.Exists(p))
+                {
+                    total += new FileInfo(p).Length;
+                }
+                else if (Directory.Exists(p))
+                {
+                    try
+                    {
+                        foreach (var f in Directory.GetFiles(p, "*", SearchOption.AllDirectories))
+                            total += new FileInfo(f).Length;
+                    }
+                    catch { }
+                }
+            }
+            return total;
+        }
+
+        // 将所选内容打包为 ZIP（在内存中构建）
+        static byte[] BuildZip(System.Collections.Generic.List<string> selections)
+        {
+            using (var ms = new MemoryStream())
+            {
+                using (var zip = new ZipArchive(ms, ZipArchiveMode.Create, true, Encoding.UTF8))
+                {
+                    var usedTopNames = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var path in selections)
+                    {
+                        if (File.Exists(path))
+                        {
+                            string top = EnsureUniqueTopName(Path.GetFileName(path), usedTopNames);
+                            AddFileToZip(zip, path, top);
+                        }
+                        else if (Directory.Exists(path))
+                        {
+                            string baseDir = new DirectoryInfo(path).FullName.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                            string top = EnsureUniqueTopName(new DirectoryInfo(path).Name, usedTopNames);
+                            // 添加空目录入口
+                            zip.CreateEntry(top + "/");
+                            foreach (var file in Directory.GetFiles(baseDir, "*", SearchOption.AllDirectories))
+                            {
+                                string rel = file.Substring(baseDir.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                                string entryName = (top + "/" + rel).Replace('\\', '/');
+                                AddFileToZip(zip, file, entryName);
+                            }
+                        }
+                    }
+                }
+                return ms.ToArray();
+            }
+        }
+
+        static string EnsureUniqueTopName(string name, System.Collections.Generic.HashSet<string> used)
+        {
+            name = name.Replace('\\', '/');
+            if (used.Add(name)) return name;
+            string baseName = Path.GetFileNameWithoutExtension(name);
+            string ext = Path.GetExtension(name);
+            int i = 2;
+            while (true)
+            {
+                string candidate = baseName + " (" + i + ")" + ext;
+                if (used.Add(candidate)) return candidate;
+                i++;
+            }
+        }
+
+        static void AddFileToZip(ZipArchive zip, string filePath, string entryName)
+        {
+            var entry = zip.CreateEntry(entryName, CompressionLevel.Optimal);
+            using (var es = entry.Open())
+            using (var fs = File.OpenRead(filePath))
+            {
+                fs.CopyTo(es);
+            }
+        }
+
+        static void GenerateSelfExtractor(string exePath, byte[] fileBytes, string fileName, string userToken, long timestampTicks)
+        {
+            // 生成密钥
+            byte[] key = DeriveKey(userToken, fileName, fileBytes.Length, timestampTicks);
+
+            // 加密：IV随机，资源内前16字节为IV
+            byte[] encryptedCombined = EncryptData(fileBytes, key);
+
+            // 创建临时资源文件来存储加密的二进制数据（IV||Ciphertext）
             string tempDir = Path.GetTempPath();
             string resourceFile = Path.Combine(tempDir, "embedded_file.dat");
-            File.WriteAllBytes(resourceFile, encryptedBytes);
+            File.WriteAllBytes(resourceFile, encryptedCombined);
 
             try
             {
-                // 动态生成的 C# 代码模板，自解压 EXE 的源代码
+                // 将用户token以Base64形式嵌入到生成的EXE（允许为空）
+                string tokenB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(userToken ?? string.Empty));
+
+                // 动态生成的 C# 代码模板：新增运行时 Key 校验与覆盖，解密后解压ZIP
                 string sourceCode = @"
 using System;
 using System.IO;
@@ -231,12 +380,21 @@ using System.Reflection;
 using System.Windows.Forms;
 using System.Security.Cryptography;
 using System.Text;
+using System.IO.Compression;
 
 namespace SelfExtractor
 {
     class Program
     {
+        // 解密所需常量（编译期写死）
         const string fileName = """ + fileName + @""";
+        const int originalFileSize = " + fileBytes.Length + @";
+        const long timestampTicks = " + timestampTicks + @"L;
+        const string userTokenB64 = """ + tokenB64 + @""";
+
+        // 新增：运行时输入的 Key（若有）
+        static string runtimeToken = null;
+
         [STAThread]
         static void Main(string[] args)
         {
@@ -254,18 +412,41 @@ namespace SelfExtractor
 
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine(""=== 自解压工具 ==="");
-            Console.WriteLine(""将释放文件: "" + fileName);
+            Console.WriteLine(""将释放内容包: "" + fileName);
             Console.ResetColor();
+
+            // 若生成时设置了非空 Key，则运行时要求输入并校验；否则直接释放
+            string tokenGen = DecodeB64(userTokenB64);
+            if (!string.IsNullOrEmpty(tokenGen))
+            {
+                Console.Write(""请输入 Key 解锁: "");
+                string input = Console.ReadLine() ?? string.Empty;
+                if (!string.Equals(input, tokenGen, StringComparison.Ordinal))
+                {
+                    string err = ""Key 不正确，程序退出。"";
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine(err);
+                    Console.ResetColor();
+                    MessageBox.Show(err, ""错误"", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+                runtimeToken = input;
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine(""Key 验证通过。"");
+                Console.ResetColor();
+            }
 
             try
             {
-                Console.WriteLine(""\n选择释放路径..."");
+                Console.WriteLine();
+                Console.WriteLine(""选择释放路径..."");
                 string targetDir = SelectOutputFolder();
                 
                 if (string.IsNullOrEmpty(targetDir))
                 {
                     Console.WriteLine(""未选择释放路径，程序退出。"");
-                    Console.WriteLine(""\n按任意键退出..."");
+                    Console.WriteLine();
+                    Console.WriteLine(""按任意键退出..."");
                     Console.ReadKey();
                     return;
                 }
@@ -279,13 +460,12 @@ namespace SelfExtractor
                     Console.ResetColor();
                 }
 
-                string targetFile = Path.Combine(targetDir, fileName);
                 byte[] fileData = GetEmbeddedFileData();
-                
-                File.WriteAllBytes(targetFile, fileData);
+                ExtractZipBytesToDirectory(fileData, targetDir);
 
                 Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine(""\n文件释放成功: "" + targetFile);
+                Console.WriteLine();
+                Console.WriteLine(""内容释放完成。"");
                 Console.ResetColor();
             }
             catch (Exception ex)
@@ -297,8 +477,52 @@ namespace SelfExtractor
                 MessageBox.Show(errorMsg, ""错误"", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
 
-            Console.WriteLine(""\n按任意键退出..."");
+            Console.WriteLine();
+            Console.WriteLine(""按任意键退出..."");
             Console.ReadKey();
+        }
+
+        static string DecodeB64(string s)
+        {
+            return Encoding.UTF8.GetString(Convert.FromBase64String(s));
+        }
+
+        // 与生成器一致的派生算法（兼容空Key）
+        static byte[] DeriveKey(string userToken, string fileName, int fileSize, long timestampTicks)
+        {
+            string safeToken = userToken ?? string.Empty;
+            string material = safeToken + ""|"" + fileName + ""|"" + fileSize.ToString() + ""|"" + timestampTicks.ToString() + ""|SelfExtractor2024"";
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                return sha256.ComputeHash(Encoding.UTF8.GetBytes(material));
+            }
+        }
+
+        // 解密：从资源读取的 combined = IV(16) || CIPHERTEXT
+        static byte[] DecryptCombined(byte[] combined, byte[] key)
+        {
+            if (combined == null || combined.Length < 17) throw new InvalidOperationException(""资源内容不完整"");
+            byte[] iv = new byte[16];
+            Buffer.BlockCopy(combined, 0, iv, 0, 16);
+            int cipherLen = combined.Length - 16;
+            byte[] cipher = new byte[cipherLen];
+            Buffer.BlockCopy(combined, 16, cipher, 0, cipherLen);
+
+            using (Aes aes = Aes.Create())
+            {
+                aes.Key = key;
+                aes.IV = iv;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+
+                using (MemoryStream ms = new MemoryStream(cipher))
+                using (CryptoStream cs = new CryptoStream(ms, aes.CreateDecryptor(), CryptoStreamMode.Read))
+                using (MemoryStream result = new MemoryStream())
+                {
+                    cs.CopyTo(result);
+                    return result.ToArray();
+                }
+            }
         }
 
         static string SelectOutputFolder()
@@ -331,54 +555,6 @@ namespace SelfExtractor
             }
         }
 
-        static byte[] DecryptData(byte[] encryptedData, byte[] key, byte[] iv)
-        {
-            using (Aes aes = Aes.Create())
-            {
-                aes.Key = key;
-                aes.IV = iv;
-                aes.Mode = CipherMode.CBC;
-                aes.Padding = PaddingMode.PKCS7;
-
-                using (MemoryStream ms = new MemoryStream(encryptedData))
-                {
-                    using (CryptoStream cs = new CryptoStream(ms, aes.CreateDecryptor(), CryptoStreamMode.Read))
-                    {
-                        using (MemoryStream result = new MemoryStream())
-                        {
-                            cs.CopyTo(result);
-                            return result.ToArray();
-                        }
-                    }
-                }
-            }
-        }
-
-        static void GenerateKeyAndIV(string fileName, int originalFileSize, out byte[] key, out byte[] iv)
-        {
-            long fixedTimestamp = 638672000000000000L;
-            
-            string complexToken = ""SelfExtractor2024_Advanced_Encryption_Token_"" + 
-                                 ""9A7B3F2E8D6C5A4B1E9F7D3C8A6B4E2F5A9D7C3B6E8F1A4C7B9E2D5F8A3C6B9E"" +
-                                 ""_ComplexSalt_"" + fileName + ""_Size_"" + originalFileSize.ToString() + 
-                                 ""_Timestamp_"" + fixedTimestamp.ToString() +
-                                 ""_RandomSeed_7F3E9A2D5C8B1F4A6E9D3B7C2A5E8F1B4D7A3C6E9F2B5A8D1C4F7B3E6A9D2C5F8"";
-
-            using (SHA256 sha256 = SHA256.Create())
-            {
-                byte[] hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(complexToken));
-                key = hashBytes;
-            }
-
-            string ivSource = complexToken + ""_IV_Salt_"" + ""F3A7B2E9D5C1A8F4B6E2D9C3A7F1B5E8D2C6A9F3B7E1C4A8D5F2B9E6C3A7F1B4"";
-            using (SHA256 sha256 = SHA256.Create())
-            {
-                byte[] ivHashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(ivSource));
-                iv = new byte[16];
-                Array.Copy(ivHashBytes, 0, iv, 0, 16);
-            }
-        }
-
         static byte[] GetEmbeddedFileData()
         {
             Assembly assembly = Assembly.GetExecutingAssembly();
@@ -402,15 +578,33 @@ namespace SelfExtractor
                 if (stream == null)
                     throw new InvalidOperationException(""无法读取嵌入的文件资源: "" + resourceName);
                 
-                byte[] encryptedBuffer = new byte[stream.Length];
-                stream.Read(encryptedBuffer, 0, encryptedBuffer.Length);
-                
-                int originalFileSize = " + fileBytes.Length + @";
-                byte[] key, iv;
-                GenerateKeyAndIV(fileName, originalFileSize, out key, out iv);
-                byte[] decryptedData = DecryptData(encryptedBuffer, key, iv);
-                
+                byte[] combined = new byte[stream.Length];
+                stream.Read(combined, 0, combined.Length);
+
+                // 使用运行时输入的 Key（如有），否则使用编译期写死的 Key
+                string token = runtimeToken ?? DecodeB64(userTokenB64);
+                byte[] key = DeriveKey(token, fileName, originalFileSize, timestampTicks);
+                byte[] decryptedData = DecryptCombined(combined, key);
                 return decryptedData;
+            }
+        }
+
+        static void ExtractZipBytesToDirectory(byte[] zipBytes, string targetDir)
+        {
+            using (var ms = new MemoryStream(zipBytes))
+            using (var zip = new ZipArchive(ms, ZipArchiveMode.Read, false, Encoding.UTF8))
+            {
+                foreach (var entry in zip.Entries)
+                {
+                    string fullPath = Path.Combine(targetDir, entry.FullName.Replace('/', Path.DirectorySeparatorChar));
+                    if (string.IsNullOrEmpty(entry.Name))
+                    {
+                        Directory.CreateDirectory(fullPath);
+                        continue;
+                    }
+                    Directory.CreateDirectory(Path.GetDirectoryName(fullPath));
+                    entry.ExtractToFile(fullPath, true);
+                }
             }
         }
     }
@@ -426,6 +620,8 @@ namespace SelfExtractor
                 parameters.ReferencedAssemblies.Add("System.dll");
                 parameters.ReferencedAssemblies.Add("System.Core.dll");
                 parameters.ReferencedAssemblies.Add("System.Windows.Forms.dll");
+                parameters.ReferencedAssemblies.Add("System.IO.Compression.dll");
+                parameters.ReferencedAssemblies.Add("System.IO.Compression.FileSystem.dll");
                 
                 // 将加密的资源文件作为嵌入资源添加
                 parameters.EmbeddedResources.Add(resourceFile);
