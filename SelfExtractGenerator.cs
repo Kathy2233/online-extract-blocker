@@ -8,7 +8,6 @@ using Microsoft.CSharp;
 using System.Windows.Forms;
 using System.Security.Cryptography;
 using System.Text;
-using System.IO.Compression;
 
 namespace SelfExtractGenerator
 {
@@ -31,28 +30,26 @@ namespace SelfExtractGenerator
                 Console.WriteLine("最大支持文件大小: " + (maxFileSize / (1024 * 1024)) + " MB ");
                 Console.ResetColor();
 
-                // 步骤1: 选择文件/文件夹（可多选）
-                Console.WriteLine("\n步骤1: 选择文件/文件夹（可多选）");
-                var selections = CollectSelections();
-                if (selections == null || selections.Count == 0)
+                // 步骤1: 选择源文件
+                Console.WriteLine("\n步骤1: 选择源文件");
+                string sourceFile = SelectSourceFile();
+                if (string.IsNullOrEmpty(sourceFile))
                 {
-                    Console.WriteLine("未选择任何内容，程序退出。");
+                    Console.WriteLine("未选择源文件，程序退出。");
                     Console.WriteLine("\n按任意键退出...");
                     Console.ReadKey();
                     return;
                 }
-
-                long totalSize = ComputeTotalSize(selections);
-                if (totalSize > maxFileSize)
+                FileInfo fileInfo = new FileInfo(sourceFile);
+                if (fileInfo.Length > maxFileSize)
                 {
-                    throw new InvalidOperationException("选择内容过大（" + (totalSize / (1024 * 1024)) + " MB），超过系统可用内存限制 (" + (maxFileSize / (1024 * 1024)) + " MB)。请减少文件或分批处理。");
+                    throw new InvalidOperationException("源文件过大（" + (fileInfo.Length / (1024 * 1024)) + " MB），超过系统可用内存限制 (" + (maxFileSize / (1024 * 1024)) + " MB)。请选择较小文件。");
                 }
 
-                // 打包为 ZIP（统一打包，便于解压端展开）
-                byte[] fileBytes = BuildZip(selections);
-                string fileName = "Package_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".zip";
+                byte[] fileBytes = File.ReadAllBytes(sourceFile);
+                string fileName = Path.GetFileName(sourceFile);
                 Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine("内容打包完成: " + fileName + " (" + fileBytes.Length + " 字节)");
+                Console.WriteLine("源文件加载成功: " + fileName + " (" + fileBytes.Length + " 字节)");
                 Console.ResetColor();
 
                 // 步骤2: 指定输出文件夹
@@ -84,7 +81,7 @@ namespace SelfExtractGenerator
 
                 Console.ForegroundColor = ConsoleColor.Green;
                 Console.WriteLine("\n自解压 EXE 生成成功: " + exePath);
-                Console.WriteLine("运行该 EXE 时，它会提示指定释放路径，然后解密并解压ZIP内容。");
+                Console.WriteLine("运行该 EXE 时，它会提示指定释放路径，然后提取原文件。");
                 Console.ResetColor();
             }
             catch (Exception ex)
@@ -215,145 +212,6 @@ namespace SelfExtractGenerator
             }
         }
 
-        // 交互式收集多选路径（文件可多选，文件夹可多次添加）
-        static System.Collections.Generic.List<string> CollectSelections()
-        {
-            var list = new System.Collections.Generic.List<string>();
-            while (true)
-            {
-                Console.Write("添加 文件(F)/文件夹(D)，完成(Enter)，取消(C): ");
-                string input = Console.ReadLine();
-                if (string.IsNullOrWhiteSpace(input)) break;
-                input = input.Trim().ToLowerInvariant();
-                if (input == "c") { list.Clear(); break; }
-                if (input == "f")
-                {
-                    try
-                    {
-                        OpenFileDialog ofd = new OpenFileDialog
-                        {
-                            Title = "选择文件（可多选）",
-                            Filter = "所有文件 (*.*)|*.*",
-                            Multiselect = true,
-                            RestoreDirectory = true
-                        };
-                        if (ofd.ShowDialog() == DialogResult.OK && ofd.FileNames?.Length > 0)
-                        {
-                            list.AddRange(ofd.FileNames);
-                            Console.WriteLine("已添加文件: " + ofd.FileNames.Length);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine("添加文件出错: " + ex.Message);
-                    }
-                }
-                else if (input == "d")
-                {
-                    try
-                    {
-                        FolderBrowserDialog fbd = new FolderBrowserDialog
-                        {
-                            Description = "选择文件夹",
-                            ShowNewFolderButton = true
-                        };
-                        if (fbd.ShowDialog() == DialogResult.OK && !string.IsNullOrWhiteSpace(fbd.SelectedPath))
-                        {
-                            list.Add(fbd.SelectedPath);
-                            Console.WriteLine("已添加文件夹: " + fbd.SelectedPath);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine("添加文件夹出错: " + ex.Message);
-                    }
-                }
-            }
-            return list;
-        }
-
-        // 计算所选内容总大小（文件夹递归）
-        static long ComputeTotalSize(System.Collections.Generic.List<string> selections)
-        {
-            long total = 0;
-            foreach (var p in selections)
-            {
-                if (File.Exists(p))
-                {
-                    total += new FileInfo(p).Length;
-                }
-                else if (Directory.Exists(p))
-                {
-                    try
-                    {
-                        foreach (var f in Directory.GetFiles(p, "*", SearchOption.AllDirectories))
-                            total += new FileInfo(f).Length;
-                    }
-                    catch { }
-                }
-            }
-            return total;
-        }
-
-        // 将所选内容打包为 ZIP（在内存中构建）
-        static byte[] BuildZip(System.Collections.Generic.List<string> selections)
-        {
-            using (var ms = new MemoryStream())
-            {
-                using (var zip = new ZipArchive(ms, ZipArchiveMode.Create, true, Encoding.UTF8))
-                {
-                    var usedTopNames = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var path in selections)
-                    {
-                        if (File.Exists(path))
-                        {
-                            string top = EnsureUniqueTopName(Path.GetFileName(path), usedTopNames);
-                            AddFileToZip(zip, path, top);
-                        }
-                        else if (Directory.Exists(path))
-                        {
-                            string baseDir = new DirectoryInfo(path).FullName.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                            string top = EnsureUniqueTopName(new DirectoryInfo(path).Name, usedTopNames);
-                            // 添加空目录入口
-                            zip.CreateEntry(top + "/");
-                            foreach (var file in Directory.GetFiles(baseDir, "*", SearchOption.AllDirectories))
-                            {
-                                string rel = file.Substring(baseDir.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                                string entryName = (top + "/" + rel).Replace('\\', '/');
-                                AddFileToZip(zip, file, entryName);
-                            }
-                        }
-                    }
-                }
-                return ms.ToArray();
-            }
-        }
-
-        static string EnsureUniqueTopName(string name, System.Collections.Generic.HashSet<string> used)
-        {
-            name = name.Replace('\\', '/');
-            if (used.Add(name)) return name;
-            string baseName = Path.GetFileNameWithoutExtension(name);
-            string ext = Path.GetExtension(name);
-            int i = 2;
-            while (true)
-            {
-                string candidate = baseName + " (" + i + ")" + ext;
-                if (used.Add(candidate)) return candidate;
-                i++;
-            }
-        }
-
-        static void AddFileToZip(ZipArchive zip, string filePath, string entryName)
-        {
-            var entry = zip.CreateEntry(entryName, CompressionLevel.Optimal);
-            using (var es = entry.Open())
-            using (var fs = File.OpenRead(filePath))
-            {
-                fs.CopyTo(es);
-            }
-        }
-
         static void GenerateSelfExtractor(string exePath, byte[] fileBytes, string fileName, string userToken, long timestampTicks)
         {
             // 生成密钥
@@ -372,7 +230,7 @@ namespace SelfExtractGenerator
                 // 将用户token以Base64形式嵌入到生成的EXE（允许为空）
                 string tokenB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(userToken ?? string.Empty));
 
-                // 动态生成的 C# 代码模板：新增运行时 Key 校验与覆盖，解密后解压ZIP
+                // 动态生成的 C# 代码模板：新增运行时 Key 校验与覆盖
                 string sourceCode = @"
 using System;
 using System.IO;
@@ -380,7 +238,6 @@ using System.Reflection;
 using System.Windows.Forms;
 using System.Security.Cryptography;
 using System.Text;
-using System.IO.Compression;
 
 namespace SelfExtractor
 {
@@ -412,7 +269,7 @@ namespace SelfExtractor
 
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine(""=== 自解压工具 ==="");
-            Console.WriteLine(""将释放内容包: "" + fileName);
+            Console.WriteLine(""将释放文件: "" + fileName);
             Console.ResetColor();
 
             // 若生成时设置了非空 Key，则运行时要求输入并校验；否则直接释放
@@ -460,12 +317,14 @@ namespace SelfExtractor
                     Console.ResetColor();
                 }
 
+                string targetFile = Path.Combine(targetDir, fileName);
                 byte[] fileData = GetEmbeddedFileData();
-                ExtractZipBytesToDirectory(fileData, targetDir);
+                
+                File.WriteAllBytes(targetFile, fileData);
 
                 Console.ForegroundColor = ConsoleColor.Green;
                 Console.WriteLine();
-                Console.WriteLine(""内容释放完成。"");
+                Console.WriteLine(""文件释放成功: "" + targetFile);
                 Console.ResetColor();
             }
             catch (Exception ex)
@@ -588,25 +447,6 @@ namespace SelfExtractor
                 return decryptedData;
             }
         }
-
-        static void ExtractZipBytesToDirectory(byte[] zipBytes, string targetDir)
-        {
-            using (var ms = new MemoryStream(zipBytes))
-            using (var zip = new ZipArchive(ms, ZipArchiveMode.Read, false, Encoding.UTF8))
-            {
-                foreach (var entry in zip.Entries)
-                {
-                    string fullPath = Path.Combine(targetDir, entry.FullName.Replace('/', Path.DirectorySeparatorChar));
-                    if (string.IsNullOrEmpty(entry.Name))
-                    {
-                        Directory.CreateDirectory(fullPath);
-                        continue;
-                    }
-                    Directory.CreateDirectory(Path.GetDirectoryName(fullPath));
-                    entry.ExtractToFile(fullPath, true);
-                }
-            }
-        }
     }
 }";
                 // 使用 CodeDom 编译源代码成 EXE
@@ -620,8 +460,6 @@ namespace SelfExtractor
                 parameters.ReferencedAssemblies.Add("System.dll");
                 parameters.ReferencedAssemblies.Add("System.Core.dll");
                 parameters.ReferencedAssemblies.Add("System.Windows.Forms.dll");
-                parameters.ReferencedAssemblies.Add("System.IO.Compression.dll");
-                parameters.ReferencedAssemblies.Add("System.IO.Compression.FileSystem.dll");
                 
                 // 将加密的资源文件作为嵌入资源添加
                 parameters.EmbeddedResources.Add(resourceFile);
