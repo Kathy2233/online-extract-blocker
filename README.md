@@ -2,7 +2,7 @@
 
 ## 项目简介 | Project Description
 本程序可以将你要分享的文件转换为自解压可执行文件（`.exe`），然后再上传到你要分享的平台。  
-这样可以防止平台通过文件 **Hash 校验** 来封禁分享链接，从而保证文件能够顺利分享。  
+这样可以防止平台通过文件 **Hash 校验** 来封禁分享链接，从而保证文件能够顺利分享，同样也可以防止某些狗的在线解压。
 
 This tool converts the files you want to share into a self-extracting executable (`.exe`) before uploading them to the target platform.  
 By doing so, it prevents the platform from blocking your shared link through **hash-based inspection**, ensuring successful file sharing.  
